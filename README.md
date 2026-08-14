@@ -149,8 +149,44 @@ python build_docker.py
 
 ```powershell
 docker load -i y2m.tar
-docker run -p 8000:8000 y2m:latest
+docker run -d --name y2m -p 8000:8000 y2m:latest
 ```
+
+Docker 环境变量可通过 `-e` 或 `--env-file` 传入。数据库应挂载到宿主机目录，避免删除容器时丢失数据：
+
+```powershell
+docker run -d `
+  --name y2m `
+  -p 8000:8000 `
+  -v D:\y2m-data:/data `
+  -e PORT=8000 `
+  -e Y2M_DB=/data/y2m.sqlite3 `
+  -e Y2M_SECURE_COOKIE=1 `
+  -e Y2M_MESSAGE_RETENTION_SECS=0 `
+  y2m:latest
+```
+
+也可以创建 `.env` 文件：
+
+```env
+PORT=8000
+Y2M_DB=/data/y2m.sqlite3
+Y2M_SECURE_COOKIE=1
+Y2M_MESSAGE_RETENTION_SECS=0
+```
+
+然后使用环境变量文件启动：
+
+```powershell
+docker run -d `
+  --name y2m `
+  --env-file .env `
+  -p 8000:8000 `
+  -v D:\y2m-data:/data `
+  y2m:latest
+```
+
+命令行参数优先于环境变量。使用 `scratch` 镜像时，容器内的数据库目录必须是已挂载且可写的目录。
 
 `build_docker.py` 默认读取 `target\x86_64-unknown-linux-musl\release\y2m`，以 `scratch` 为基座生成极小的单层镜像；可用 `--binary`、`--tag`、`--port`、`-o` 覆盖默认值。
 

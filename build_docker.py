@@ -31,6 +31,14 @@ def make_layer(binary_path: str) -> bytes:
         raise SystemExit(f"二进制文件为空或读取失败: {binary_path}")
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
+        # scratch 镜像没有标准临时目录，SQLite 在线备份需要它创建目标文件。
+        info = tarfile.TarInfo(name="tmp/")
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o1777
+        info.uid = info.gid = 0
+        info.uname = info.gname = "root"
+        info.mtime = 0
+        tar.addfile(info)
         info = tarfile.TarInfo(name="y2m")
         info.size = len(data)
         info.mode = 0o755

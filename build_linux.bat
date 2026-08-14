@@ -20,6 +20,8 @@ if errorlevel 1 (
 )
 
 echo Building Y2M Chat for generic Linux with Zig (static musl binary)...
+rem Zig 0.16 emits a deprecated -Wl,-O1 compatibility notice; it is not a Rust warning.
+set "RUSTFLAGS=-A linker_messages %RUSTFLAGS%"
 cargo zigbuild --release --target %TARGET% --manifest-path "%~dp0Cargo.toml"
 
 if errorlevel 1 (

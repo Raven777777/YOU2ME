@@ -945,7 +945,12 @@ async fn backup_database(State(state): State<AppState>, headers: HeaderMap) -> R
         .take(32)
         .map(char::from)
         .collect();
-    let temp = std::env::temp_dir().join(format!("y2m-backup-{stamp}-{nonce}.sqlite3"));
+    let temp_dir = std::env::temp_dir();
+    if let Err(error) = std::fs::create_dir_all(&temp_dir) {
+        eprintln!("backup temp directory error: {error}");
+        return server_error("创建备份临时目录失败");
+    }
+    let temp = temp_dir.join(format!("y2m-backup-{stamp}-{nonce}.sqlite3"));
     let temp_for_closure = temp.clone();
     let result = state
         .db
