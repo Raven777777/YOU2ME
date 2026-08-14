@@ -232,8 +232,7 @@ body.room-menu-open .room-menu-backdrop { opacity: 1; pointer-events: auto; }
 .messages { flex: 1; overflow: auto; padding: 24px; background: var(--bg); }
 .message { display: flex; align-items: flex-start; gap: 10px; max-width: 100%; margin-bottom: 18px; }
 .message.own { flex-direction: row-reverse; }
-.message-avatar { flex: 0 0 34px; width: 34px; height: 34px; color: var(--primary-ink); background: #788fcb; font-size: 12px; }
-.message.own .message-avatar { color: #332b38; background: #c98eae; }
+.message-avatar { flex: 0 0 34px; width: 34px; height: 34px; font-size: 12px; }
 
 .message-body { min-width: 0; max-width: min(75%, 700px); }
 .message-meta { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }

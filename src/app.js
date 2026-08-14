@@ -318,7 +318,7 @@ function messageElement(item) {
     minute: "2-digit",
   });
   const avatar = document.createElement("span");
-  avatar.className = "message-avatar";
+  avatar.className = `message-avatar ${avatarColor(item.username)}`;
   avatar.textContent = item.username.slice(0, 1).toUpperCase();
 
   const body = document.createElement("div");

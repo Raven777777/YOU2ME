@@ -56,7 +56,7 @@ cargo build --release
 | `build_debug.bat` | 调试构建 | `target\debug\y2m.exe` |
 | `build_release.bat` | 发布构建 | `target\release\y2m.exe` |
 | `build_linux.bat` | 静态 Linux 构建（需 [Zig](https://ziglang.org/download/) + `cargo-zigbuild`） | `target\x86_64-unknown-linux-musl\release\y2m` |
-| `build_docker.py` | 打包 Docker 镜像（纯 Python，无需 Docker） | `y2m.tar` |
+| `build_docker.py` | 打包 Docker 镜像（纯 Python，无需 Docker） | `y2m-<version>.tar` |
 
 ## 启动参数
 
@@ -145,11 +145,13 @@ cargo build --release
 python build_docker.py
 ```
 
+执行 `build_docker.py` 时会询问版本号；脚本会将版本号写入镜像标签，并使用当前 UTC 时间作为镜像创建时间。
+
 在装有 Docker 的机器上：
 
 ```powershell
-docker load -i y2m.tar
-docker run -d --name y2m -p 8000:8000 y2m:latest
+docker load -i y2m-0.1.1.tar
+docker run -d --name y2m -p 8000:8000 y2m:0.1.1
 ```
 
 Docker 环境变量可通过 `-e` 或 `--env-file` 传入。数据库应挂载到宿主机目录，避免删除容器时丢失数据：
@@ -163,7 +165,7 @@ docker run -d `
   -e Y2M_DB=/data/y2m.sqlite3 `
   -e Y2M_SECURE_COOKIE=1 `
   -e Y2M_MESSAGE_RETENTION_SECS=0 `
-  y2m:latest
+  y2m:0.1.1
 ```
 
 也可以创建 `.env` 文件：
@@ -183,12 +185,12 @@ docker run -d `
   --env-file .env `
   -p 8000:8000 `
   -v D:\y2m-data:/data `
-  y2m:latest
+  y2m:0.1.1
 ```
 
 命令行参数优先于环境变量。使用 `scratch` 镜像时，容器内的数据库目录必须是已挂载且可写的目录。
 
-`build_docker.py` 默认读取 `target\x86_64-unknown-linux-musl\release\y2m`，以 `scratch` 为基座生成极小的单层镜像；可用 `--binary`、`--tag`、`--port`、`-o` 覆盖默认值。
+`build_docker.py` 默认读取 `target\x86_64-unknown-linux-musl\release\y2m`，以 `scratch` 为基座生成极小的单层镜像；输入版本号 `0.1.1` 时默认生成 `y2m-0.1.1.tar`，镜像标签为 `y2m:0.1.1`。可用 `--binary`、`--tag`、`--port`、`-o` 覆盖默认值。
 
 ## 技术栈
 
