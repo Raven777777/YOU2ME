@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>y2m</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <!-- Auth Screen -->
+    <div id="loginView" class="auth-screen hidden">
+        <div class="auth-card">
+            <a href="#" class="mark">y2m</a>
+            <p class="kicker">A SMALL PLACE TO TALK</p>
+            <h1>说点想说的。</h1>
+            <p class="auth-copy">和熟悉的人，在一个安静的房间里保持联系。</p>
+            
+            <form id="loginForm" class="auth-form">
+                <label>用户名</label><input id="loginUser" type="text" placeholder="输入用户名" required>
+                <label>密码</label><input id="loginPass" type="password" placeholder="输入密码" required>
+                <div id="loginError" class="form-error"></div>
+                <button class="button" type="submit">进入房间 ↗</button>
+            </form>
+            <button id="showRegister" class="text-button" type="button">还没有账号？创建一个</button>
+            <div class="auth-foot">private by design · sqlite storage</div>
+        </div>
+    </div>
+
+    <!-- Main App Shell -->
+    <div id="appView" class="app-shell hidden">
+        <div class="app-main">
+            <!-- Room Drawer -->
+            <aside class="room-panel">
+                <div class="drawer-head">
+                    <a href="#" class="wordmark">y2m</a>
+                    <button id="closeRoomMenu" class="drawer-close" type="button">×</button>
+                </div>
+                <div class="drawer-account">
+                    <div id="accountAvatar" class="account-avatar">U</div>
+                    <div>
+                        <b id="currentUser">用户名</b>
+                        <small><span class="online-dot"></span>已连接</small>
+                    </div>
+                    <button id="newRoom" class="round-button" type="button">＋</button>
+                </div>
+                <div class="room-tools">
+                    <div class="search-wrap"><input id="roomSearch" type="text" placeholder="⌕ 搜索"></div>
+                    <button id="refreshRooms" class="subtle-button" type="button">↻</button>
+                </div>
+                <div id="roomList" class="room-list">
+                </div>
+                <button id="logout" class="drawer-setting" type="button">退出登录</button>
+            </aside>
+            <div id="roomMenuBackdrop" class="room-menu-backdrop"></div>
+
+            <!-- Conversation Area -->
+            <div class="conversation">
+                <header class="conversation-head">
+                    <button id="roomMenuButton" class="room-trigger" type="button" aria-expanded="false">
+                        <div class="room-avatar">R</div>
+                        <div class="room-heading">
+                            <h2 id="roomName">请选择聊天室</h2>
+                            <p id="roomMeta">从左侧选择一个公共房间</p>
+                        </div>
+                        <span class="room-trigger-icon">⌄</span>
+                    </button>
+                    <div class="conversation-actions">
+                        <button id="copyCode" class="soft-button hidden" type="button">复制房间码</button>
+                        <button id="deleteRoom" class="soft-button danger hidden" type="button">删除房间</button>
+                    </div>
+                </header>
+
+                <div id="noConversation" class="conversation-empty">
+                    <div class="empty-shape">▣</div>
+                    <h3>选择一个聊天室</h3>
+                    <p>加入公共房间后开始聊天</p>
+                    <button id="emptyRoomMenuButton" class="empty-action" type="button">打开聊天室</button>
+                </div>
+                <div id="conversationView" class="hidden">
+                  <div id="messages" class="messages">
+                  </div>
+                </div>
+
+                <form id="messageForm" class="composer hidden">
+                      <textarea id="messageInput" placeholder="输入消息..." disabled></textarea>
+                      <button id="sendButton" class="send-button" type="submit" disabled>↑</button>
+                      <button class="search-toggle" type="button">⌕</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <!-- Search Modal -->
+    <div class="message-query">
+        <button class="search-close" type="button">×</button>
+        <p class="kicker">SEARCH</p>
+        <h2>查找聊天记录</h2>
+        <p class="modal-copy">按关键词、日期或顺序筛选</p>
+        <div class="query-input"><input id="messageSearch" type="text" placeholder="⌕ 查询内容..."></div>
+        <div class="search-fields">
+            <label>日期<input id="messageDate" type="date" title="按日期查找"></label>
+            <label>排序<select id="messageOrder"><option value="asc">从早到晚</option><option value="desc">从晚到早</option></select></label>
+        </div>
+        <button id="searchMessages" class="button" type="button">查询 ↗</button>
+        <button id="clearMessageSearch" class="text-button" type="button">清除筛选</button>
+    </div>
+
+    <!-- New Account Modal -->
+    <div id="registerDialog" class="modal-backdrop hidden">
+        <div class="modal">
+            <button id="cancelRegister" class="modal-close" type="button">×</button>
+            <h2>NEW ACCOUNT</h2>
+            <p class="modal-copy">创建你的账号<br>用户名支持中文、英文、日文，注册后不可修改。</p>
+            <form id="registerForm" class="auth-form">
+                <label>用户名</label><input id="registerUser" type="text" placeholder="用户名必须唯一" required>
+                <label>密码</label><input id="registerPass" type="password" placeholder="输入密码" required>
+                <label>确认密码</label><input id="registerConfirm" type="password" placeholder="再次输入密码" required>
+                <label>邀请码（如服务器要求）</label><input id="registerInvite" type="text" placeholder="可选">
+                <div id="registerError" class="form-error"></div>
+                <button class="button" type="submit">创建账号 ↗</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- New Room Modal -->
+    <div id="roomDialog" class="modal-backdrop hidden">
+        <div class="modal small-modal">
+            <button id="cancelRoom" class="modal-close" type="button">×</button>
+            <h2>A NEW ROOM</h2>
+            <p class="modal-copy">新建聊天室<br>创建后你会成为房主。房间对所有用户公开。</p>
+            <form id="roomForm" class="auth-form">
+                <label>房间名称</label><input id="newRoomName" type="text" placeholder="例如：周五晚上" required>
+                <div id="roomError" class="form-error"></div>
+                <button class="button" type="submit">创建房间 ↗</button>
+            </form>
+        </div>
+    </div>
+
+    <script src="app.js" defer></script>
+</body>
+</html>
