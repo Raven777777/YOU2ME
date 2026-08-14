@@ -186,8 +186,6 @@ cargo install cargo-audit
 cargo audit
 ```
 
-当前审计结果：`Cargo.lock` 中的 113 个依赖未发现已知安全漏洞。
-
 ## License
 
 [MIT](LICENSE) © 2026 Raven777777
