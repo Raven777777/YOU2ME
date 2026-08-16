@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, Rng};
 use rusqlite::{
     backup::Backup, params, params_from_iter, types::Value as SqlValue, Connection,
     OptionalExtension,
@@ -43,8 +43,11 @@ const REGISTRATION_MODE_KEY: &str = "registration_mode";
 const REGISTRATION_INVITE_KEY: &str = "registration_invite";
 const SESSION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const MAX_SESSIONS: usize = 10_000;
+const MAX_SESSIONS_PER_USER: usize = 20;
 const LOGIN_WINDOW_SECS: i64 = 60;
 const MAX_LOGIN_ATTEMPTS: usize = 5;
+const MAX_LOGIN_ATTEMPTS_PER_IP: usize = 30;
+const MAX_LOGIN_IPS: usize = 100_000;
 const MAX_LOGIN_USERS: usize = 10_000;
 const REGISTRATION_WINDOW_SECS: i64 = 60 * 60;
 const MAX_REGISTRATION_ATTEMPTS: usize = 10;
@@ -56,6 +59,8 @@ const MESSAGE_RETENTION_SECS: i64 = 0;
 #[derive(Clone)]
 struct AppState {
     db: DbConnection,
+    restore_lock: Arc<tokio::sync::Mutex<()>>,
+    login_attempts_by_ip: Arc<Mutex<HashMap<String, VecDeque<i64>>>>,
     database: String,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     login_attempts: Arc<Mutex<HashMap<String, VecDeque<i64>>>>,
@@ -81,6 +86,51 @@ impl std::error::Error for StartupError {}
 struct Session {
     user_id: i64,
     expires_at: i64,
+}
+
+fn insert_session(
+    sessions: &mut HashMap<String, Session>,
+    token: String,
+    user_id: i64,
+    current_time: i64,
+) {
+    sessions.retain(|_, session| session.expires_at > current_time);
+
+    // 防止单个账号通过反复登录挤掉其他用户的会话。
+    while sessions
+        .values()
+        .filter(|session| session.user_id == user_id)
+        .count()
+        >= MAX_SESSIONS_PER_USER
+    {
+        let Some(oldest_token) = sessions
+            .iter()
+            .filter(|(_, session)| session.user_id == user_id)
+            .min_by_key(|(_, session)| session.expires_at)
+            .map(|(token, _)| token.clone())
+        else {
+            break;
+        };
+        sessions.remove(&oldest_token);
+    }
+
+    if sessions.len() >= MAX_SESSIONS {
+        if let Some(oldest_token) = sessions
+            .iter()
+            .min_by_key(|(_, session)| session.expires_at)
+            .map(|(token, _)| token.clone())
+        {
+            sessions.remove(&oldest_token);
+        }
+    }
+
+    sessions.insert(
+        token,
+        Session {
+            user_id,
+            expires_at: current_time + SESSION_TTL_SECS,
+        },
+    );
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -135,6 +185,14 @@ fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+fn is_constraint_violation(error: &tokio_rusqlite::Error) -> bool {
+    matches!(
+        error,
+        tokio_rusqlite::Error::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
 fn db_error<E: std::fmt::Display>(error: E) -> Response {
     eprintln!("database error: {error}");
     response(
@@ -209,13 +267,25 @@ fn same_origin_request(headers: &HeaderMap) -> bool {
     websocket_origin_allowed(headers) && !origin.is_empty()
 }
 
+fn browser_cross_site_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+}
+
 async fn security_headers(request: Request, next: Next) -> Response {
     let is_state_change = matches!(
         request.method(),
         &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
     );
-    if is_state_change && !same_origin_request(request.headers()) {
-        return response(StatusCode::FORBIDDEN, json!({"error":"无效的请求来源"}));
+    if is_state_change {
+        // 现代浏览器会为跨站表单/请求发送 Sec-Fetch-Site: cross-site；
+        // Origin 缺失时仅靠 SameSite Cookie 无法覆盖“登录 CSRF”等场景。
+        if browser_cross_site_request(request.headers()) || !same_origin_request(request.headers())
+        {
+            return response(StatusCode::FORBIDDEN, json!({"error":"无效的请求来源"}));
+        }
     }
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
@@ -242,14 +312,46 @@ fn clear_session_cookie(secure: bool) -> String {
         if secure { "; Secure" } else { "" }
     )
 }
-fn env_nonnegative_i64(name: &str, default: i64) -> i64 {
+fn env_nonnegative_i64(name: &str, default: i64) -> Result<i64, String> {
     match env::var(name) {
         Ok(value) => value
             .parse::<i64>()
-            .ok()
-            .filter(|value| *value >= 0)
-            .unwrap_or(default),
-        Err(_) => default,
+            .map_err(|_| format!("环境变量 {name} 必须是非负整数"))
+            .and_then(|value| {
+                if value >= 0 {
+                    Ok(value)
+                } else {
+                    Err(format!("环境变量 {name} 必须是非负整数"))
+                }
+            }),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_positive_u16(name: &str, default: u16) -> Result<u16, String> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u16>()
+            .map_err(|_| format!("环境变量 {name} 必须是 1-65535 的端口号"))
+            .and_then(|value| {
+                if value > 0 {
+                    Ok(value)
+                } else {
+                    Err(format!("环境变量 {name} 必须是 1-65535 的端口号"))
+                }
+            }),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_bool(name: &str, default: bool) -> Result<bool, String> {
+    match env::var(name) {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "yes" | "true" | "1" => Ok(true),
+            "no" | "false" | "0" => Ok(false),
+            _ => Err(format!("环境变量 {name} 只能使用 yes/no")),
+        },
+        Err(_) => Ok(default),
     }
 }
 
@@ -271,17 +373,22 @@ fn next_argument(args: &[String], index: &mut usize, flag: &str) -> Result<Strin
 }
 
 fn runtime_config() -> Result<RuntimeConfig, String> {
-    let mut port = env::var("PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(8000);
-    let mut database = env::var("Y2M_DB").unwrap_or_else(|_| "y2m.sqlite3".into());
-    let mut message_retention_secs =
-        env_nonnegative_i64("Y2M_MESSAGE_RETENTION_SECS", MESSAGE_RETENTION_SECS);
-    let mut max_messages_per_room = 0;
-    let mut secure_cookie = env::var("Y2M_SECURE_COOKIE").is_ok_and(|value| value == "1");
     let args: Vec<String> = env::args().skip(1).collect();
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        println!("用法: y2m [-p 8000] [-db ./y2m.sqlite3] [-ms 0] [-rm 0] [-cook yes|no] [-debug]");
+        std::process::exit(0);
+    }
+
+    // 先解析命令行，确保命令行参数真正优先于环境变量：
+    // 只有命令行未提供的字段才读取并校验环境变量。
+    let mut port_override = None;
+    let mut database_override = None;
+    let mut message_retention_override = None;
+    let mut max_messages_override = None;
+    let mut secure_cookie_override = None;
     let mut debug = false;
     let mut index = 0;
     while index < args.len() {
@@ -289,45 +396,68 @@ fn runtime_config() -> Result<RuntimeConfig, String> {
             "-debug" | "--debug" => debug = true,
             "-p" => {
                 let value = next_argument(&args, &mut index, "-p")?;
-                port = value
-                    .parse::<u16>()
-                    .ok()
-                    .filter(|port| *port > 0)
-                    .ok_or_else(|| "-p 必须是 1-65535 的端口号".to_string())?;
+                port_override = Some(
+                    value
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|port| *port > 0)
+                        .ok_or_else(|| "-p 必须是 1-65535 的端口号".to_string())?,
+                );
             }
-            "-db" => database = next_argument(&args, &mut index, "-db")?,
+            "-db" => database_override = Some(next_argument(&args, &mut index, "-db")?),
             "-ms" => {
                 let value = next_argument(&args, &mut index, "-ms")?;
-                message_retention_secs = value
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|seconds| *seconds >= 0)
-                    .ok_or_else(|| "-ms 必须是非负整数秒数，0 表示永不删除".to_string())?;
+                message_retention_override = Some(
+                    value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|seconds| *seconds >= 0)
+                        .ok_or_else(|| "-ms 必须是非负整数秒数，0 表示永不删除".to_string())?,
+                );
             }
             "-rm" => {
                 let value = next_argument(&args, &mut index, "-rm")?;
-                max_messages_per_room = value
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|count| *count >= 0)
-                    .ok_or_else(|| "-rm 必须是非负整数条数，0 表示不限制".to_string())?;
+                max_messages_override = Some(
+                    value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|count| *count >= 0)
+                        .ok_or_else(|| "-rm 必须是非负整数条数，0 表示不限制".to_string())?,
+                );
             }
             "-cook" => {
                 let value = next_argument(&args, &mut index, "-cook")?;
-                secure_cookie = match value.to_ascii_lowercase().as_str() {
+                secure_cookie_override = Some(match value.to_ascii_lowercase().as_str() {
                     "yes" | "true" | "1" => true,
                     "no" | "false" | "0" => false,
                     _ => return Err("-cook 只能使用 yes/no".to_string()),
-                };
-            }
-            "-h" | "--help" => {
-                println!("用法: y2m [-p 8000] [-db ./y2m.sqlite3] [-ms 0] [-rm 0] [-cook yes|no] [-debug]");
-                std::process::exit(0);
+                });
             }
             unknown => return Err(format!("未知参数: {unknown}")),
         }
         index += 1;
     }
+
+    let port = match port_override {
+        Some(port) => port,
+        None => env_positive_u16("PORT", 8000)?,
+    };
+    let database = match database_override {
+        Some(database) => database,
+        None => env::var("Y2M_DB").unwrap_or_else(|_| "y2m.sqlite3".into()),
+    };
+    let message_retention_secs = match message_retention_override {
+        Some(seconds) => seconds,
+        None => env_nonnegative_i64("Y2M_MESSAGE_RETENTION_SECS", MESSAGE_RETENTION_SECS)?,
+    };
+    let max_messages_per_room = match max_messages_override {
+        Some(count) => count,
+        None => env_nonnegative_i64("Y2M_MAX_MESSAGES_PER_ROOM", 0)?,
+    };
+    let secure_cookie = match secure_cookie_override {
+        Some(secure_cookie) => secure_cookie,
+        None => env_bool("Y2M_SECURE_COOKIE", false)?,
+    };
     if database.trim().is_empty() {
         return Err("数据库路径不能为空".to_string());
     }
@@ -340,23 +470,42 @@ fn runtime_config() -> Result<RuntimeConfig, String> {
         debug,
     })
 }
-fn login_allowed(state: &AppState, username: &str) -> bool {
+
+fn login_allowed(state: &AppState, username: &str, source: &str) -> bool {
+    let current_time = now();
     let mut attempts = match state.login_attempts.lock() {
+        Ok(attempts) => attempts,
+        Err(_) => return false,
+    };
+    if !attempt_allowed(
+        &mut attempts,
+        username,
+        current_time,
+        LOGIN_WINDOW_SECS,
+        MAX_LOGIN_ATTEMPTS,
+        MAX_LOGIN_USERS,
+    ) {
+        return false;
+    }
+    let mut attempts = match state.login_attempts_by_ip.lock() {
         Ok(attempts) => attempts,
         Err(_) => return false,
     };
     attempt_allowed(
         &mut attempts,
-        username,
-        now(),
+        source,
+        current_time,
         LOGIN_WINDOW_SECS,
-        MAX_LOGIN_ATTEMPTS,
-        MAX_LOGIN_USERS,
+        MAX_LOGIN_ATTEMPTS_PER_IP,
+        MAX_LOGIN_IPS,
     )
 }
-fn clear_login_attempts(state: &AppState, username: &str) {
+fn clear_login_attempts(state: &AppState, username: &str, source: &str) {
     if let Ok(mut attempts) = state.login_attempts.lock() {
         attempts.remove(username);
+    }
+    if let Ok(mut attempts) = state.login_attempts_by_ip.lock() {
+        attempts.remove(source);
     }
 }
 fn attempt_allowed(
@@ -459,6 +608,14 @@ fn clean(value: &str, max: usize) -> String {
     value.trim().chars().take(max).collect()
 }
 
+fn random_alphanumeric(length: usize) -> String {
+    (&mut rand::rng())
+        .sample_iter(Alphanumeric)
+        .take(length)
+        .map(char::from)
+        .collect()
+}
+
 fn valid_username(username: &str) -> bool {
     !username.is_empty() && !username.chars().any(char::is_control)
 }
@@ -517,11 +674,7 @@ async fn ensure_admin(state: &AppState) -> Result<Option<String>, String> {
     if has_admin {
         return Ok(None);
     }
-    let password: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(24)
-        .map(char::from)
-        .collect();
+    let password = random_alphanumeric(24);
     let hash = hash_password(state, password.clone())
         .await
         .map_err(|_| "无法生成默认管理员密码哈希".to_string())?;
@@ -663,16 +816,21 @@ async fn register(
         .await
     {
         Ok(_) => response(StatusCode::OK, json!({"ok":true})),
-        Err(error) if error.to_string().contains("UNIQUE") => {
+        Err(error) if is_constraint_violation(&error) => {
             response(StatusCode::CONFLICT, json!({"error":"用户名已存在"}))
         }
         Err(error) => db_error(error),
     }
 }
 
-async fn login(State(state): State<AppState>, Json(input): Json<Credentials>) -> Response {
+async fn login(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(input): Json<Credentials>,
+) -> Response {
     let login_name = clean(&input.username, 24);
-    if !login_allowed(&state, &login_name) {
+    let source = peer.ip().to_string();
+    if !login_allowed(&state, &login_name, &source) {
         return response(
             StatusCode::TOO_MANY_REQUESTS,
             json!({"error":"登录尝试过于频繁，请稍后重试"}),
@@ -724,37 +882,16 @@ async fn login(State(state): State<AppState>, Json(input): Json<Credentials>) ->
             json!({"error":"用户名或密码错误"}),
         );
     }
-    clear_login_attempts(&state, &username);
-    let token: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(48)
-        .map(char::from)
-        .collect();
+    clear_login_attempts(&state, &username, &source);
+    let token = random_alphanumeric(48);
     let mut sessions = match state.sessions.lock() {
         Ok(sessions) => sessions,
         Err(_) => return server_error("session lock poisoned"),
     };
-    let current_time = now();
-    sessions.retain(|_, session| session.expires_at > current_time);
-    if sessions.len() >= MAX_SESSIONS {
-        if let Some(oldest_token) = sessions
-            .iter()
-            .min_by_key(|(_, session)| session.expires_at)
-            .map(|(token, _)| token.clone())
-        {
-            sessions.remove(&oldest_token);
-            debug(
-                &state,
-                "session cache limit reached; evicted oldest session",
-            );
-        }
-    }
-    sessions.insert(
-        token.clone(),
-        Session {
-            user_id: id,
-            expires_at: current_time + SESSION_TTL_SECS,
-        },
+    insert_session(&mut sessions, token.clone(), id, now());
+    debug(
+        &state,
+        format!("session created user_id={id} active={}", sessions.len()),
     );
     (
         StatusCode::OK,
@@ -803,18 +940,24 @@ async fn admin_user_id(state: &AppState, headers: &HeaderMap) -> Result<i64, Res
     let is_admin = state
         .db
         .call(move |db| {
-            Ok(db.query_row(
-                "SELECT is_admin FROM users WHERE id=?1",
-                params![uid],
-                |row| row.get::<_, i64>(0),
-            )?)
+            Ok(db
+                .query_row(
+                    "SELECT is_admin FROM users WHERE id=?1",
+                    params![uid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?)
         })
         .await;
     match is_admin {
-        Ok(1) => Ok(uid),
-        Ok(_) => Err(response(
+        Ok(Some(1)) => Ok(uid),
+        Ok(Some(_)) => Err(response(
             StatusCode::FORBIDDEN,
             json!({"error":"需要管理员权限"}),
+        )),
+        Ok(None) => Err(response(
+            StatusCode::UNAUTHORIZED,
+            json!({"error":"请先登录"}),
         )),
         Err(error) => Err(db_error(error)),
     }
@@ -897,6 +1040,9 @@ fn apply_pending_restore(database: &str) {
     }
     let old = format!("{database}.old");
     let _ = std::fs::remove_file(&old);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{old}{suffix}"));
+    }
 
     // 先把原库移开（重试等待上一个进程释放文件句柄）
     let moved_aside = if Path::new(database).exists() {
@@ -917,20 +1063,46 @@ fn apply_pending_restore(database: &str) {
         eprintln!("[restore] 原数据库文件被占用，取消恢复");
         return;
     }
+
+    // 同步移走 WAL/SHM：成功恢复时清理；失败回滚时尽量恢复原库的未 checkpoint 数据。
     for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{database}{suffix}"));
+        let source = format!("{database}{suffix}");
+        let target = format!("{old}{suffix}");
+        if !Path::new(&source).exists() {
+            continue;
+        }
+        if let Err(error) = std::fs::rename(&source, &target) {
+            eprintln!("[restore] 移动 {source} 失败: {error}");
+            // 宁可丢弃原库 WAL，也不能让它污染即将恢复的新库。
+            let _ = std::fs::remove_file(&source);
+        }
     }
+
     match std::fs::rename(&staging, database) {
         Ok(_) => {
             let _ = std::fs::remove_file(&old);
+            for suffix in ["-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{old}{suffix}"));
+            }
             println!("[restore] 已应用数据库备份");
         }
-        Err(_) => {
+        Err(error) => {
+            eprintln!("[restore] 应用备份失败: {error}，正在回退原数据库");
             if Path::new(&old).exists() {
-                let _ = std::fs::rename(&old, database);
+                if let Err(error) = std::fs::rename(&old, database) {
+                    eprintln!("[restore] 回退原数据库失败: {error}");
+                }
+            }
+            for suffix in ["-wal", "-shm"] {
+                let source = format!("{old}{suffix}");
+                let target = format!("{database}{suffix}");
+                if Path::new(&source).exists() {
+                    if let Err(error) = std::fs::rename(&source, &target) {
+                        eprintln!("[restore] 回退 {source} 失败: {error}");
+                    }
+                }
             }
             let _ = std::fs::remove_file(&staging);
-            eprintln!("[restore] 应用备份失败，已回退原数据库");
         }
     }
 }
@@ -940,11 +1112,7 @@ async fn backup_database(State(state): State<AppState>, headers: HeaderMap) -> R
         return error;
     }
     let stamp = now();
-    let nonce: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
+    let nonce = random_alphanumeric(32);
     let temp_dir = std::env::temp_dir();
     if let Err(error) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("backup temp directory error: {error}");
@@ -986,6 +1154,72 @@ async fn backup_database(State(state): State<AppState>, headers: HeaderMap) -> R
         .unwrap_or_else(|_| server_error("构建备份响应失败"))
 }
 
+fn restore_database_is_compatible(connection: &Connection) -> rusqlite::Result<bool> {
+    let required_tables = [
+        (
+            "users",
+            &["id", "username", "password_hash", "created_at"][..],
+        ),
+        ("server_settings", &["key", "value"][..]),
+        (
+            "rooms",
+            &["id", "code", "name", "owner_id", "created_at"][..],
+        ),
+        ("room_members", &["room_id", "user_id"][..]),
+        (
+            "messages",
+            &["id", "room_id", "user_id", "text", "created_at"][..],
+        ),
+    ];
+
+    for (table, required_columns) in required_tables {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            params![table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            // init_db 会在启动时为缺失的表创建兼容结构。
+            continue;
+        }
+        let mut statement = connection.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let columns = statement
+            .query_map(params![table], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if required_columns
+            .iter()
+            .any(|name| !columns.iter().any(|column| column == name))
+        {
+            return Ok(false);
+        }
+        if table == "users" {
+            let has_admin_column = columns.iter().any(|column| column == "is_admin");
+            let has_admin: bool = connection.query_row(
+                if has_admin_column {
+                    "SELECT EXISTS(SELECT 1 FROM users WHERE is_admin=1)"
+                } else {
+                    "SELECT 0"
+                },
+                [],
+                |row| row.get(0),
+            )?;
+            // 若备份里没有管理员且默认管理员用户名已被普通账号占用，
+            // 启动时的 ensure_admin 会失败并让服务无法启动。
+            if !has_admin {
+                let default_username_exists: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM users WHERE username=?1)",
+                    params![DEFAULT_ADMIN_USERNAME],
+                    |row| row.get(0),
+                )?;
+                if default_username_exists {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 async fn restore_backup(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1000,6 +1234,8 @@ async fn restore_backup(
             json!({"error":"无效的 SQLite 备份文件"}),
         );
     }
+    // 串行化恢复流程，避免两个并发请求写坏同一个 staging 文件。
+    let restore_guard = state.restore_lock.clone().lock_owned().await;
     let staging = format!("{}.restore", state.database);
     if let Err(error) = tokio::fs::write(&staging, &bytes).await {
         eprintln!("restore write error: {error}");
@@ -1011,20 +1247,30 @@ async fn restore_backup(
             &staging_for_validation,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Ok(false);
+        }
+        restore_database_is_compatible(&connection)
     })
     .await;
     match valid {
-        Ok(Ok(result)) if result == "ok" => {}
+        Ok(Ok(true)) => {}
         _ => {
             let _ = tokio::fs::remove_file(&staging).await;
-            return response(StatusCode::BAD_REQUEST, json!({"error":"备份文件已损坏"}));
+            return response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"备份文件无效或结构不兼容"}),
+            );
         }
     }
     let exe = std::env::current_exe().ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // 持有锁直到进程退出，防止后续请求再次覆盖待恢复文件。
+        drop(restore_guard);
         spawn_restart(exe, args);
         std::process::exit(0);
     });
@@ -1074,12 +1320,7 @@ async fn list_rooms(State(state): State<AppState>, headers: HeaderMap) -> Respon
 
 fn room_code(db: &Connection) -> rusqlite::Result<String> {
     loop {
-        let code: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(6)
-            .map(char::from)
-            .collect::<String>()
-            .to_uppercase();
+        let code = random_alphanumeric(6).to_uppercase();
         if db
             .query_row("SELECT id FROM rooms WHERE code=?1", params![code], |_| {
                 Ok(())
@@ -1370,6 +1611,12 @@ async fn messages(
     }
     let mut sql="SELECT m.id,u.username,m.text,m.created_at FROM messages m JOIN users u ON u.id=m.user_id WHERE m.room_id = ?".to_string();
     let mut values = vec![SqlValue::Integer(query.room)];
+    if state.message_retention_secs > 0 {
+        sql.push_str(" AND m.created_at >= ?");
+        values.push(SqlValue::Integer(
+            now().saturating_sub(state.message_retention_secs),
+        ));
+    }
     if let Some(after) = query.after {
         sql.push_str(" AND m.id > ?");
         values.push(SqlValue::Integer(after));
@@ -1464,17 +1711,18 @@ async fn send_message(
     let result = state
         .db
         .call(move |db| {
-            if !is_member(db, input.room, uid)? {
+            let transaction = db.transaction()?;
+            if !is_member(&transaction, input.room, uid)? {
                 return Ok(SendMessageOutcome::NotMember);
             }
             if retention_secs > 0 {
-                db.execute(
+                transaction.execute(
                     "DELETE FROM messages WHERE room_id=?1 AND created_at < ?2",
                     params![input.room, expiration],
                 )?;
             }
             if max_messages_per_room > 0 {
-                let room_full: bool = db.query_row(
+                let room_full: bool = transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM messages WHERE room_id=?1 LIMIT 1 OFFSET ?2)",
                     params![input.room, max_messages_per_room - 1],
                     |row| row.get(0),
@@ -1483,12 +1731,12 @@ async fn send_message(
                     return Ok(SendMessageOutcome::RoomFull);
                 }
             }
-            db.execute(
+            transaction.execute(
                 "INSERT INTO messages(room_id,user_id,text,created_at) VALUES(?1,?2,?3,?4)",
                 params![input.room, uid, text, now()],
             )?;
-            let id = db.last_insert_rowid();
-            let event = db.query_row(
+            let id = transaction.last_insert_rowid();
+            let event = transaction.query_row(
                 "SELECT m.id,m.room_id,u.username,m.text,m.created_at FROM messages m JOIN users u ON u.id=m.user_id WHERE m.id=?1",
                 params![id],
                 |row| Ok(MessageEvent {
@@ -1499,6 +1747,7 @@ async fn send_message(
                     created_at: row.get(4)?,
                 }),
             )?;
+            transaction.commit()?;
             Ok(SendMessageOutcome::Sent(event))
         })
         .await;
@@ -1683,7 +1932,9 @@ async fn main() {
         database: config.database.clone(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         login_attempts: Arc::new(Mutex::new(HashMap::new())),
+        login_attempts_by_ip: Arc::new(Mutex::new(HashMap::new())),
         registration_attempts: Arc::new(Mutex::new(HashMap::new())),
+        restore_lock: Arc::new(tokio::sync::Mutex::new(())),
         password_work: Arc::new(tokio::sync::Semaphore::new(2)),
         secure_cookie: config.secure_cookie,
         message_retention_secs: config.message_retention_secs,
@@ -1707,7 +1958,11 @@ async fn main() {
     if retention_secs > 0 {
         let cleanup_db = state.db.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+            // 清理周期跟随保留时长，但限制在 1 秒到 24 小时之间，
+            // 避免极小周期空转或极大 Duration 触发计时器溢出。
+            let cleanup_period_secs = retention_secs.clamp(1, 24 * 60 * 60);
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(cleanup_period_secs as u64));
             loop {
                 interval.tick().await;
                 let expiration = now().saturating_sub(retention_secs);
@@ -1723,7 +1978,11 @@ async fn main() {
                         .await;
                     match deleted {
                         Ok(count) if count >= 1000 => continue,
-                        _ => break,
+                        Ok(_) => break,
+                        Err(error) => {
+                            eprintln!("message cleanup error: {error}");
+                            break;
+                        }
                     }
                 }
             }
@@ -1829,9 +2088,98 @@ mod tests {
     }
 
     #[test]
+    fn cross_site_fetch_header_is_detected() {
+        let mut headers = HeaderMap::new();
+        assert!(!browser_cross_site_request(&headers));
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(!browser_cross_site_request(&headers));
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(browser_cross_site_request(&headers));
+    }
+
+    #[test]
     fn usernames_cannot_contain_control_characters() {
         assert!(valid_username("井水玉藻"));
         assert!(!valid_username("user\nname"));
         assert!(!valid_username("user\0name"));
+    }
+
+    #[test]
+    fn session_insertion_caps_sessions_per_user() {
+        let mut sessions = HashMap::new();
+        for index in 0..MAX_SESSIONS_PER_USER {
+            insert_session(
+                &mut sessions,
+                format!("user1-{index}"),
+                1,
+                1_000 + index as i64,
+            );
+        }
+        insert_session(&mut sessions, "user2".to_string(), 2, 1_000);
+        for index in 0..5 {
+            insert_session(
+                &mut sessions,
+                format!("user1-extra-{index}"),
+                1,
+                2_000 + index as i64,
+            );
+        }
+        assert_eq!(
+            sessions
+                .values()
+                .filter(|session| session.user_id == 1)
+                .count(),
+            MAX_SESSIONS_PER_USER
+        );
+        assert!(sessions.contains_key("user2"));
+    }
+
+    #[test]
+    fn compatible_restore_schema_is_accepted() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password_hash TEXT, created_at INTEGER);
+                 CREATE TABLE server_settings (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE rooms (id INTEGER PRIMARY KEY, code TEXT, name TEXT, owner_id INTEGER, created_at INTEGER);
+                 CREATE TABLE room_members (room_id INTEGER, user_id INTEGER);
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY, room_id INTEGER, user_id INTEGER, text TEXT, created_at INTEGER);",
+            )
+            .unwrap();
+        assert!(restore_database_is_compatible(&connection).unwrap());
+    }
+
+    #[test]
+    fn incompatible_restore_schema_is_rejected() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        assert!(!restore_database_is_compatible(&connection).unwrap());
+    }
+
+    #[test]
+    fn restore_rejects_default_admin_name_conflict_without_admin() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password_hash TEXT, created_at INTEGER, is_admin INTEGER DEFAULT 0);
+                 INSERT INTO users(username,password_hash,created_at,is_admin) VALUES('井水玉藻','x',0,0);",
+            )
+            .unwrap();
+        assert!(!restore_database_is_compatible(&connection).unwrap());
+    }
+
+    #[test]
+    fn like_escape_protects_wildcards() {
+        assert_eq!(escape_like(r"100%_a\b"), r"100\%\_a\\b");
+    }
+
+    #[test]
+    fn random_tokens_have_requested_length() {
+        assert_eq!(random_alphanumeric(24).chars().count(), 24);
+        assert!(random_alphanumeric(32)
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric()));
     }
 }

@@ -122,13 +122,15 @@ function connectMessageSocket(roomId) {
   messageSocket = socket;
   socket.onopen = () => {
     reconnectDelay = 1000;
-    socket.send(JSON.stringify({ room: roomId, last_id: latestMessageId }));
-    void syncMessagesAfter(roomId, latestMessageId);
+    socket.send(JSON.stringify({ room: roomId }));
   };
   socket.onmessage = (event) => {
     let data;
     try { data = JSON.parse(event.data); } catch { return; }
-    if (data.type === "message" && data.message?.room_id === roomId) {
+    if (data.type === "subscribed" && data.room === roomId) {
+      // 收到订阅确认后再拉取增量，避免订阅尚未生效时漏掉广播消息。
+      void syncMessagesAfter(roomId, latestMessageId);
+    } else if (data.type === "message" && data.message?.room_id === roomId) {
       appendLiveMessage(data.message);
     } else if (data.type === "sync_required") {
       void syncMessagesAfter(roomId, latestMessageId);
@@ -342,18 +344,10 @@ function messageElement(item) {
   return row;
 }
 
-async function loadMessages(reset = false, refresh = false, older = false) {
+async function loadMessages(reset = false, older = false) {
   if (!currentRoom || loadingMessages || (!older && loadingOlder)) return;
   const roomId = currentRoom.id;
   const box = $("messages");
-  const followNewMessages =
-    reset &&
-    refresh &&
-    messageQuery === "" &&
-    !$("messageDate")?.value &&
-    (messageOrder === "desc"
-      ? box.scrollTop < 48
-      : box.scrollHeight - box.scrollTop - box.clientHeight < 48);
   const controller = new AbortController();
   messageAbortController = controller;
   loadingMessages = true;
@@ -373,52 +367,40 @@ async function loadMessages(reset = false, refresh = false, older = false) {
       signal: controller.signal,
     });
     if (controller.signal.aborted || currentRoom?.id !== roomId) return;
-    if (reset && !refresh) {
+
+    if (reset) {
       box.replaceChildren();
       renderedMessageIds.clear();
       oldestId = null;
     }
-    if (reset && refresh && messageQuery === "" && !$("messageDate")?.value) {
-      const existing = new Set(
-        [...box.querySelectorAll("[data-message-id]")].map(
-          (element) => element.dataset.messageId,
-        ),
-      );
-      const newMessages = data.messages.filter((item) => !existing.has(String(item.id)));
-      newMessages.forEach((item) => renderedMessageIds.add(String(item.id)));
-      if (messageOrder === "desc") box.prepend(...newMessages.reverse().map(messageElement));
-      else box.append(...newMessages.map(messageElement));
-      if (newMessages.length && followNewMessages)
-        box.scrollTop = messageOrder === "desc" ? 0 : box.scrollHeight;
-    } else if (reset) {
-      const ordered =
-        messageOrder === "desc" ? [...data.messages].reverse() : data.messages;
-      renderedMessageIds.clear();
-      ordered.forEach((item) => renderedMessageIds.add(String(item.id)));
+    const ordered =
+      messageOrder === "desc" ? [...data.messages].reverse() : data.messages;
+    ordered.forEach((item) => renderedMessageIds.add(String(item.id)));
+    if (reset) {
       box.replaceChildren(...ordered.map(messageElement));
     } else {
       const height = box.scrollHeight;
-      const ordered =
-        messageOrder === "desc" ? [...data.messages].reverse() : data.messages;
-      ordered.forEach((item) => renderedMessageIds.add(String(item.id)));
       if (messageOrder === "desc") box.append(...ordered.map(messageElement));
       else box.prepend(...ordered.map(messageElement));
       if (messageOrder === "asc") box.scrollTop = box.scrollHeight - height;
     }
-    if (data.messages.length)
+
+    if (data.messages.length) {
       oldestId = Math.min(
         ...data.messages.map((item) => item.id),
         oldestId || Infinity,
       );
-    if (data.messages.length)
-      latestMessageId = Math.max(latestMessageId, ...data.messages.map((item) => Number(item.id)));
+      latestMessageId = Math.max(
+        latestMessageId,
+        ...data.messages.map((item) => Number(item.id)),
+      );
+    }
     hasMore = data.has_more;
     box.classList.toggle("has-more", hasMore);
-    if (reset && !refresh)
-      box.scrollTop = messageOrder === "desc" ? 0 : box.scrollHeight;
+    if (reset) box.scrollTop = messageOrder === "desc" ? 0 : box.scrollHeight;
   } catch (error) {
     if (controller.signal.aborted) return;
-    if (!refresh) alertBox(error.message);
+    alertBox(error.message);
   } finally {
     if (messageAbortController === controller) {
       loadingMessages = false;
@@ -430,7 +412,7 @@ async function loadMessages(reset = false, refresh = false, older = false) {
 async function loadOlder() {
   if (!hasMore || loadingOlder) return;
   loadingOlder = true;
-  await loadMessages(false, false, true);
+  await loadMessages(false, true);
   loadingOlder = false;
 }
 
@@ -479,6 +461,21 @@ async function createRoom(event) {
   }
 }
 
+function showEmptyConversation() {
+  currentRoom = null;
+  show("noConversation");
+  hide("conversationView");
+  hide("messageForm");
+  setText("roomName", "请选择聊天室");
+  setText("roomMeta", "从左侧选择一个公共房间");
+  const messages = $("messages");
+  if (messages) messages.replaceChildren();
+  $("messageInput").disabled = true;
+  $("sendButton").disabled = true;
+  hide("copyCode");
+  hide("deleteRoom");
+}
+
 async function removeRoom() {
   if (!currentRoom || !confirm(`确定删除聊天室“${currentRoom.name}”吗？`))
     return;
@@ -486,17 +483,7 @@ async function removeRoom() {
     await api(`/api/rooms/${currentRoom.id}`, { method: "DELETE" });
     localStorage.removeItem("y2m_last_room");
     stopConversation();
-    currentRoom = null;
-    show("noConversation");
-    hide("conversationView");
-    hide("messageForm");
-    setText("roomName", "请选择聊天室");
-    setText("roomMeta", "从左侧选择一个公共房间");
-    $("messages").replaceChildren();
-    $("messageInput").disabled = true;
-    $("sendButton").disabled = true;
-    hide("copyCode");
-    hide("deleteRoom");
+    showEmptyConversation();
     await loadRooms();
   } catch (error) {
     alertBox(error.message);
@@ -731,10 +718,9 @@ function logout() {
   stopConversation();
   isAdmin = false;
   username = "";
-  currentRoom = null;
+  showEmptyConversation();
   hide("appView");
   show("loginView");
-  hide("messageForm");
   $("loginPass").value = "";
 }
 

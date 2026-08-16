@@ -90,7 +90,8 @@ cargo build --release
 | `PORT` | `8000` | 监听端口 |
 | `Y2M_DB` | `y2m.sqlite3` | SQLite 数据库文件路径 |
 | `Y2M_MESSAGE_RETENTION_SECS` | `0` | 消息保留秒数，`0` 表示永不按时间删除 |
-| `Y2M_SECURE_COOKIE` | 未设置 | 设为 `1` 时启用 Secure Cookie |
+| `Y2M_MAX_MESSAGES_PER_ROOM` | `0` | 每个房间的消息数量上限，`0` 表示不限制 |
+| `Y2M_SECURE_COOKIE` | 未设置 | 设为 `yes` / `1` 时启用 Secure Cookie，`no` / `0` 关闭 |
 
 ## 管理员
 
@@ -103,14 +104,14 @@ cargo build --release
 
 请登录后立即修改密码。管理员可在「设置」中选择开放注册或仅限邀请码注册，并设置邀请码。
 
-为减少批量注册滥用，同一来源 IP 每小时最多尝试注册 10 次。服务直接使用 TCP 对端 IP，不信任转发请求头；部署在反向代理后时，限流按代理来源统计。
+为减少批量注册滥用，同一来源 IP 每小时最多尝试注册 10 次。登录接口按用户名（每分钟 5 次）和来源 IP（每分钟 30 次）双重限流，登录成功后重置计数。服务直接使用 TCP 对端 IP，不信任转发请求头；部署在反向代理后时，限流按代理来源统计。
 
 ### 数据备份与恢复
 
 管理员在「设置 → 数据库」页签可管理数据：
 
 - **下载备份**：通过 SQLite 在线备份 API 导出一致快照，浏览器下载 `.sqlite3` 文件。
-- **恢复备份**：上传备份文件（校验 SQLite 格式），服务写入待恢复文件后自动重启并应用；恢复会清空当前内存会话，所有用户需重新登录。
+- **恢复备份**：上传备份文件（校验 SQLite 完整性与表结构），服务写入待恢复文件后自动重启并应用；恢复会清空当前内存会话，所有用户需重新登录。
 
 备份/恢复接口仅管理员可用：`GET /api/admin/backup`、`POST /api/admin/backup/restore`。
 
@@ -165,6 +166,7 @@ docker run -d `
   -e Y2M_DB=/data/y2m.sqlite3 `
   -e Y2M_SECURE_COOKIE=1 `
   -e Y2M_MESSAGE_RETENTION_SECS=0 `
+  -e Y2M_MAX_MESSAGES_PER_ROOM=0 `
   y2m:0.1.1
 ```
 
@@ -175,6 +177,7 @@ PORT=8000
 Y2M_DB=/data/y2m.sqlite3
 Y2M_SECURE_COOKIE=1
 Y2M_MESSAGE_RETENTION_SECS=0
+Y2M_MAX_MESSAGES_PER_ROOM=0
 ```
 
 然后使用环境变量文件启动：
